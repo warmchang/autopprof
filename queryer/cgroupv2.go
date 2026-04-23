@@ -34,6 +34,7 @@ type cgroupV2 struct {
 
 	cpuQuota float64
 
+	// q is the CPU-usage snapshot queue.
 	q cpuUsageSnapshotQueuer
 }
 
@@ -54,6 +55,7 @@ func (c *cgroupV2) CPUUsage() (float64, error) {
 	if err != nil {
 		return 0, err
 	}
+
 	c.snapshotCPUUsage(stat.CPU.UsageUsec) // In microseconds.
 
 	// Calculate the usage only if there are enough snapshots.
