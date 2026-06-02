@@ -15,8 +15,8 @@ import (
 )
 
 type autoPprof struct {
-	watchInterval               time.Duration
-	minConsecutiveOverThreshold int
+	watchInterval  time.Duration
+	reportCooldown time.Duration
 
 	reporter      report.Reporter
 	reportTimeout time.Duration
@@ -91,21 +91,29 @@ func start(opt Option) error {
 	if opt.ReportTimeout > 0 {
 		reportTimeout = opt.ReportTimeout
 	}
+	watchInterval := defaultWatchInterval
+	if opt.WatchInterval > 0 {
+		watchInterval = opt.WatchInterval
+	}
+	reportCooldown := defaultReportCooldown
+	if opt.ReportCooldown > 0 {
+		reportCooldown = opt.ReportCooldown
+	}
 	profr := newDefaultProfiler(defaultCPUProfilingDuration)
 	ap := &autoPprof{
-		watchInterval:               defaultWatchInterval,
-		minConsecutiveOverThreshold: defaultMinConsecutiveOverThreshold,
-		reporter:                    opt.Reporter,
-		reportTimeout:               reportTimeout,
-		app:                         app,
-		disableCPUProf:              opt.DisableCPUProf,
-		disableMemProf:              opt.DisableMemProf,
-		disableGoroutineProf:        opt.DisableGoroutineProf,
-		cgroupQueryer:               cgroupQryer,
-		runtimeQueryer:              runtimeQryer,
-		profiler:                    profr,
-		cascadedRunners:             make(map[string]*metricRunner),
-		stopC:                       make(chan struct{}),
+		watchInterval:        watchInterval,
+		reportCooldown:       reportCooldown,
+		reporter:             opt.Reporter,
+		reportTimeout:        reportTimeout,
+		app:                  app,
+		disableCPUProf:       opt.DisableCPUProf,
+		disableMemProf:       opt.DisableMemProf,
+		disableGoroutineProf: opt.DisableGoroutineProf,
+		cgroupQueryer:        cgroupQryer,
+		runtimeQueryer:       runtimeQryer,
+		profiler:             profr,
+		cascadedRunners:      make(map[string]*metricRunner),
+		stopC:                make(chan struct{}),
 	}
 	if !ap.disableCPUProf {
 		if err := ap.loadCPUQuota(); err != nil {
@@ -239,14 +247,16 @@ func newRunner(m Metric, globalInterval time.Duration) *metricRunner {
 	}
 }
 
-// watchMetric runs the unified watch loop. minConsecutiveOverThreshold
-// debounces repeat fires: report on the first tick above threshold,
-// suppress until the counter drops below threshold or wraps around.
+// watchMetric runs the unified watch loop. reportCooldown debounces
+// repeat fires: report on the first tick above threshold, then suppress
+// further reports for that metric until the cooldown has elapsed.
+// Dropping below the threshold re-arms an immediate report on the next
+// breach.
 func (ap *autoPprof) watchMetric(runner *metricRunner, isBuiltin bool) {
 	ticker := time.NewTicker(runner.interval)
 	defer ticker.Stop()
 
-	var cnt int
+	var lastReport time.Time
 	for {
 		select {
 		case <-ticker.C:
@@ -258,10 +268,11 @@ func (ap *autoPprof) watchMetric(runner *metricRunner, isBuiltin bool) {
 				return
 			}
 			if value < runner.threshold {
-				cnt = 0
+				lastReport = time.Time{}
 				continue
 			}
-			if cnt == 0 {
+			now := time.Now()
+			if lastReport.IsZero() || now.Sub(lastReport) >= ap.reportCooldown {
 				if err := ap.fireReport(runner, value); err != nil {
 					log.Println(fmt.Errorf(
 						"autopprof: metric %q report failed: %w", runner.name, err,
@@ -270,10 +281,7 @@ func (ap *autoPprof) watchMetric(runner *metricRunner, isBuiltin bool) {
 				if isBuiltin {
 					ap.cascadeBuiltIn(runner.name)
 				}
-			}
-			cnt++
-			if cnt >= ap.minConsecutiveOverThreshold {
-				cnt = 0
+				lastReport = now
 			}
 		case <-ap.stopC:
 			return
